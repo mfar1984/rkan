@@ -9,9 +9,21 @@ use Pusher\Pusher;
 
 class BroadcastingController extends Controller
 {
-    public function index()
+    public function index(Request $request)
     {
-        return view('broadcasting');
+        $joinStreamId = $request->query('join');
+        $viewMode = $request->query('view');
+        
+        if ($joinStreamId) {
+            // Join existing stream mode
+            return view('broadcasting', ['mode' => 'join', 'stream_id' => $joinStreamId]);
+        } elseif ($viewMode) {
+            // View stream mode (for viewers)
+            return view('broadcasting', ['mode' => 'view', 'stream_id' => $viewMode]);
+        } else {
+            // Start new stream mode
+            return view('broadcasting', ['mode' => 'broadcast']);
+        }
     }
 
     public function startStream(Request $request)
@@ -20,16 +32,29 @@ class BroadcastingController extends Controller
         $streamId = 'stream_' . $user->id . '_' . time();
         
         // Store stream info in cache
-        Cache::put($streamId, [
+        $streamData = [
             'user_id' => $user->id,
             'user_name' => $user->name,
             'title' => $request->input('title', 'Live Stream'),
             'description' => $request->input('description', 'Welcome to my live stream!'),
             'started_at' => now(),
             'viewers' => 1, // Start with 1 viewer (the broadcaster)
+            'viewer_sessions' => [session()->getId()],
             'is_live' => true,
             'camera_device' => $request->input('camera_device', 'default')
-        ], 3600); // 1 hour
+        ];
+        
+        Cache::put($streamId, $streamData, 3600); // 1 hour
+
+        // Track active streams
+        $activeStreams = Cache::get('active_streams', []);
+        if (!in_array($streamId, $activeStreams)) {
+            $activeStreams[] = $streamId;
+            Cache::put('active_streams', $activeStreams, 3600);
+        }
+
+        // Add activity
+        $this->addActivity('stream_started', "{$user->name} started a live stream: {$request->input('title', 'Live Stream')}");
 
         return response()->json([
             'success' => true,
@@ -52,6 +77,17 @@ class BroadcastingController extends Controller
             $streamData['is_live'] = false;
             $streamData['ended_at'] = now();
             Cache::put($streamId, $streamData, 3600);
+
+            // Remove from active streams
+            $activeStreams = Cache::get('active_streams', []);
+            $activeStreams = array_diff($activeStreams, [$streamId]);
+            Cache::put('active_streams', $activeStreams, 3600);
+
+            // Add activity
+            $this->addActivity('stream_ended', "{$streamData['user_name']} ended their live stream");
+
+            // Clear stream cache after 5 minutes
+            Cache::forget($streamId);
         }
 
         return response()->json([
@@ -120,16 +156,26 @@ class BroadcastingController extends Controller
             $streamData = Cache::get($streamId);
             
             if ($action === 'join') {
-                $streamData['viewers']++;
+                // Only increment if not already counted
+                if (!isset($streamData['viewer_sessions']) || !in_array(session()->getId(), $streamData['viewer_sessions'])) {
+                    $streamData['viewers'] = ($streamData['viewers'] ?? 1) + 1;
+                    $streamData['viewer_sessions'] = $streamData['viewer_sessions'] ?? [];
+                    $streamData['viewer_sessions'][] = session()->getId();
+                }
             } elseif ($action === 'leave') {
-                $streamData['viewers'] = max(1, $streamData['viewers'] - 1); // Keep at least 1 viewer
+                // Only decrement if this session was counted
+                if (isset($streamData['viewer_sessions']) && in_array(session()->getId(), $streamData['viewer_sessions'])) {
+                    $streamData['viewers'] = max(1, ($streamData['viewers'] ?? 1) - 1);
+                    $streamData['viewer_sessions'] = array_diff($streamData['viewer_sessions'], [session()->getId()]);
+                }
             }
             
             Cache::put($streamId, $streamData, 3600);
         } else {
             // Create stream if it doesn't exist (for demo purposes)
             $streamData = [
-                'viewers' => $action === 'join' ? 1 : 0,
+                'viewers' => 1,
+                'viewer_sessions' => [session()->getId()],
                 'is_live' => true
             ];
             Cache::put($streamId, $streamData, 3600);
@@ -236,5 +282,24 @@ class BroadcastingController extends Controller
             // Log error but don't break the app
             \Log::error('Pusher broadcast failed: ' . $e->getMessage());
         }
+    }
+
+    private function addActivity($type, $message)
+    {
+        $activities = Cache::get('recent_activities', []);
+        
+        $newActivity = [
+            'id' => time(),
+            'type' => $type,
+            'message' => $message,
+            'created_at' => now()->toISOString()
+        ];
+        
+        array_unshift($activities, $newActivity);
+        
+        // Keep only last 50 activities
+        $activities = array_slice($activities, 0, 50);
+        
+        Cache::put('recent_activities', $activities, 3600);
     }
 } 
